@@ -80,6 +80,16 @@ static inline float frand(uint32_t *s){               /* xorshift32 → [0,1) */
 static inline int rnd_int(uint32_t *s, int count){    /* bounded 0..count-1 */
     int v=(int)(frand(s)*(float)count); if(v<0)v=0; if(v>=count)v=count-1; return v;
 }
+/* Seed RNG + entropy pool from OS entropy so randomizers are truly random from the
+ * very first tap (Magneto pattern), with a fixed fallback if /dev/urandom is absent. */
+static void seed_urandom(uint32_t *rng, uint32_t *ent){
+    uint32_t r=0x12345678u, e=0xB5297A4Du; unsigned char b[8];
+    FILE *u=fopen("/dev/urandom","rb");
+    if(u){ if(fread(b,1,8,u)==8){
+        r=((uint32_t)b[0]<<24)|((uint32_t)b[1]<<16)|((uint32_t)b[2]<<8)|b[3];
+        e=((uint32_t)b[4]<<24)|((uint32_t)b[5]<<16)|((uint32_t)b[6]<<8)|b[7]; } fclose(u); }
+    if(r==0u) r=0x9e3779b9u; if(e==0u) e=0xB5297A4Du; *rng=r; *ent=e;
+}
 
 /* ── Palette effect IDs (0 = Off; group order = LED colour) ──────────────────── */
 enum {
@@ -187,6 +197,12 @@ typedef struct {
     int    current_level;     /* page-aware knob overlay (see LEVELS) */
     uint32_t rng;
     uint32_t ent;             /* live entropy pool (stirred from audio + sample_pos) */
+    /* randomize/preset DUCK: fade out -> apply at silence -> fade back in */
+    int      pending_rnd;     /* 0 none, 1 patch, 2 effect (param-only rnds apply instantly) */
+    int      pending_preset;  /* -1 none, else target preset index */
+    float    rnd_gain;        /* output duck envelope (1 = full) */
+    int      rnd_phase;       /* 0 idle, 1 fade-out, 2 fade-in, 3 silent-hold */
+    int      rnd_hold;        /* samples of silence remaining */
     /* ── GLOBAL page ─────────────────────────────────────────────── */
     float  feedback, fb_sm;   /* global feedback send 0..1 (smoothed) */
     int    tempo_src;         /* 0 = Move (host clock), 1 = Int */
@@ -1067,29 +1083,68 @@ static void set_slot_select(palette_t *p, int slot, int requested, int dir){
  *  RANDOMIZERS  (design-spec §4) — all across the 4 slots at once.
  *  Effect picks are WITHOUT REPLACEMENT (distinct), bypassing the skip-walk.
  * ═══════════════════════════════════════════════════════════════════════════ */
-static void pick_distinct_effects(palette_t *p, uint32_t *rng){
-    int pool[NUM_FX]; for(int i=0;i<NUM_FX;i++) pool[i]=i+1;   /* 1..24 */
-    for(int i=NUM_FX-1;i>0;i--){ int j=rnd_int(rng,i+1); int t=pool[i];pool[i]=pool[j];pool[j]=t; }
-    /* Free any current selections first so a Clouds effect can move slots without
-     * a transient double-allocation, then assign the 4 distinct picks. */
-    for(int s=0;s<NUM_SLOTS;s++) slot_apply_select(p,s,PFX_OFF);
-    for(int s=0;s<NUM_SLOTS;s++) slot_apply_select(p,s,pool[s]);
+static int is_drive_fx(int fx){   /* drive/distortion set — capped at 2 per patch */
+    return fx==PFX_DRIVE||fx==PFX_FUZZ||fx==PFX_HOWL||fx==PFX_FOLD||fx==PFX_SQUASH;
 }
-static void rnd_patch(palette_t *p){                 /* everything new */
-    pick_distinct_effects(p,&p->rng);
-    for(int s=0;s<NUM_SLOTS;s++){
-        p->slots[s].amount=frand(&p->rng);
-        p->slots[s].macro =frand(&p->rng);
-        p->slots[s].drift =frand(&p->rng);
+static int is_harsh_fx(int fx){   /* screech/destruction — skew amount lower */
+    return fx==PFX_FUZZ||fx==PFX_HOWL||fx==PFX_FOLD||fx==PFX_BROKEN||fx==PFX_INTERFERENCE;
+}
+/* Clear the global feedback loop so a hot / self-oscillating tail doesn't carry into
+ * a freshly randomized patch or loaded preset. */
+static void clear_feedback(palette_t *p){
+    p->fb_lp_l=p->fb_lp_r=p->fb_hp_l=p->fb_hp_r=0.0f;
+    for(int i=0;i<MAXFRAMES;i++){ p->fbL[i]=0.0f; p->fbR[i]=0.0f; }
+}
+/* Category-weighted patch picker: ~70% "balanced" (one distinct effect from each of
+ * the 4 groups, random slot order — the Chroma feel), ~30% fully free distinct picks
+ * (weird stacks). Hard rule either way: never more than TWO drive/distortion effects. */
+static void pick_patch(palette_t *p, uint32_t *rng){
+    int picks[NUM_SLOTS];
+    if(frand(rng) < 0.70f){
+        static const int GSTART[4]={PFX_DRIVE,PFX_DOUBLER,PFX_CASCADE,PFX_FILTER};
+        for(int g=0;g<4;g++) picks[g]=GSTART[g]+rnd_int(rng,6);   /* one per category (6 each) */
+        for(int i=3;i>0;i--){ int j=rnd_int(rng,i+1); int t=picks[i];picks[i]=picks[j];picks[j]=t; }
+    } else {
+        int pool[NUM_FX]; for(int i=0;i<NUM_FX;i++) pool[i]=i+1;
+        for(int i=NUM_FX-1;i>0;i--){ int j=rnd_int(rng,i+1); int t=pool[i];pool[i]=pool[j];pool[j]=t; }
+        for(int s=0;s<NUM_SLOTS;s++) picks[s]=pool[s];
     }
+    /* enforce <=2 drives: replace extras with a distinct non-drive effect */
+    for(int guard=0; guard<32; guard++){
+        int drives=0; for(int s=0;s<NUM_SLOTS;s++) if(is_drive_fx(picks[s])) drives++;
+        if(drives<=2) break;
+        for(int s=0;s<NUM_SLOTS;s++){
+            if(is_drive_fx(picks[s])){
+                int repl,dup; do { repl=1+rnd_int(rng,NUM_FX); dup=0;
+                    for(int q=0;q<NUM_SLOTS;q++) if(q!=s && picks[q]==repl) dup=1;
+                } while(is_drive_fx(repl) || dup);
+                picks[s]=repl; break;
+            }
+        }
+    }
+    for(int s=0;s<NUM_SLOTS;s++) slot_apply_select(p,s,PFX_OFF);
+    for(int s=0;s<NUM_SLOTS;s++) slot_apply_select(p,s,picks[s]);
 }
-static void rnd_effect(palette_t *p){ pick_distinct_effects(p,&p->rng); }   /* keep params */
-static void rnd_amount(palette_t *p){ for(int s=0;s<NUM_SLOTS;s++) p->slots[s].amount=frand(&p->rng); }
+/* Weighted per-slot params: amounts present but rarely maxed, harsher effects tamed,
+ * drift skewed low (tasteful instability). */
+static void rnd_slot_params(palette_t *p, int s){
+    float amt=0.30f+0.60f*frand(&p->rng);            /* 0.30..0.90 */
+    if(is_harsh_fx(p->slots[s].select)) amt*=0.6f;   /* keep screech in check */
+    p->slots[s].amount=amt;
+    p->slots[s].macro =frand(&p->rng);
+    p->slots[s].drift =frand(&p->rng)*frand(&p->rng)*0.7f;   /* skew low */
+}
+static void rnd_patch(palette_t *p){                 /* effects + weighted params */
+    pick_patch(p,&p->rng);
+    for(int s=0;s<NUM_SLOTS;s++) rnd_slot_params(p,s);
+}
+static void rnd_effect(palette_t *p){ pick_patch(p,&p->rng); }   /* effects only, keep params */
+static void rnd_amount(palette_t *p){ for(int s=0;s<NUM_SLOTS;s++){
+    float a=0.30f+0.60f*frand(&p->rng); if(is_harsh_fx(p->slots[s].select))a*=0.6f; p->slots[s].amount=a; } }
 static void rnd_macro (palette_t *p){ for(int s=0;s<NUM_SLOTS;s++) p->slots[s].macro =frand(&p->rng); }
-/* Rnd Values — randomize all three params (Amount+Macro+Drift) on every slot at
- * once, KEEPING the current effects. The "tweak the random chain" workflow. */
-static void rnd_values(palette_t *p){ for(int s=0;s<NUM_SLOTS;s++){
-    p->slots[s].amount=frand(&p->rng); p->slots[s].macro=frand(&p->rng); p->slots[s].drift=frand(&p->rng); } }
+/* Rnd Values — randomize Amount+Macro+Drift on every slot, KEEPING the current
+ * effects (the "tweak the random chain" workflow). */
+static void rnd_values(palette_t *p){ for(int s=0;s<NUM_SLOTS;s++) rnd_slot_params(p,s); }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  PRESETS — 25 factory patches. Each shows a chain the Chroma physically can't
@@ -1198,8 +1253,8 @@ static void *create_instance(const char *module_dir, const char *json){
     p->fx_reorder = 0;                          /* 1-2-3-4 */
     p->current_preset = 1;
     p->current_level = 1;                       /* LV_PALETTE — landing mirrors Console knobs */
-    p->rng = 0x12345678u;
-    p->ent = 0xB5297A4Du;                        /* nonzero so the xorshift pool churns */
+    seed_urandom(&p->rng, &p->ent);             /* true random from the first tap */
+    p->pending_rnd=0; p->pending_preset=-1; p->rnd_gain=1.0f; p->rnd_phase=0; p->rnd_hold=0;
     load_preset(p, 1);                          /* start on Init (Drive→Doubler→Cascade→Filter) */
     if(g_host && g_host->log) g_host->log("[palette] instance created");
     return p;
@@ -1260,17 +1315,30 @@ static float get_float_key(palette_t *p, const char *key){
     return 0;
 }
 
+/* Applied from the audio thread at the silent bottom of the duck: the heavy Clouds
+ * swap (if any) happens here, unheard. Preset first, then the pending randomize. */
+static void apply_pending(palette_t *p){
+    int had_preset = p->pending_preset>=0;
+    if(had_preset){ load_preset(p, p->pending_preset); p->pending_preset=-1; }
+    int r=p->pending_rnd; p->pending_rnd=0;
+    if(r==1) rnd_patch(p); else if(r==2) rnd_effect(p);
+    if(had_preset || r==1 || r==2) clear_feedback(p);   /* patch-level -> reset feedback loop */
+}
+
 static void fire_trigger(palette_t *p, const char *key){
-    /* fold accumulated audio entropy + exact tap timing into the RNG so each press
-     * is genuinely random (the base seed alone would replay the same sequence). */
+    /* fold audio entropy + exact tap timing into the RNG (extra entropy on top of
+     * the urandom seed) so every press is genuinely random. */
     p->rng ^= p->ent + p->sample_pos*2654435761u + 0x9e3779b9u;
     p->rng = p->rng*1664525u + 1013904223u;
     if(p->rng==0u) p->rng=0x9e3779b9u;
-    if(!strcmp(key,"rnd_patch"))  rnd_patch(p);
-    else if(!strcmp(key,"rnd_effect")) rnd_effect(p);
-    else if(!strcmp(key,"rnd_amount")) rnd_amount(p);
-    else if(!strcmp(key,"rnd_macro"))  rnd_macro(p);
-    else if(!strcmp(key,"rnd_values"))  rnd_values(p);
+    /* param-only randomizers are already 15 ms-smoothed -> apply instantly, no duck */
+    if(!strcmp(key,"rnd_amount")){ rnd_amount(p); return; }
+    if(!strcmp(key,"rnd_macro")){  rnd_macro(p);  return; }
+    if(!strcmp(key,"rnd_values")){ rnd_values(p); return; }
+    /* effect-changing randomizers duck (fade out -> swap at silence -> fade in) */
+    int which = !strcmp(key,"rnd_patch") ? 1 : !strcmp(key,"rnd_effect") ? 2 : 0;
+    if(!which || p->rnd_phase!=0) return;   /* ignore re-fire while a duck runs */
+    p->pending_rnd=which; p->rnd_phase=1;
 }
 
 /* knob delta dispatch (page-aware) */
@@ -1286,7 +1354,9 @@ static void apply_knob_delta(palette_t *p, const char *key, int delta){
         return;
     }
     if(!strcmp(key,"current_preset")){
-        load_preset(p, clampi(p->current_preset+delta,1,NUM_PRESETS));
+        int idx=clampi(p->current_preset+delta,1,NUM_PRESETS);
+        p->current_preset=idx; p->pending_preset=idx;      /* display now, apply at duck silence */
+        if(p->rnd_phase==0||p->rnd_phase==2) p->rnd_phase=1;
         return;
     }
     if(!strncmp(key,"rnd_",4)){ return; }  /* momentary enum: fires via direct set_param("1") only */
@@ -1336,7 +1406,9 @@ static void set_param(void *instance, const char *key, const char *val){
     /* triggers: wide-range int tap-to-fire (NOT enum["0","1"]) */
     if(!strncmp(key,"rnd_",4)){ if(atoi(val)!=0) fire_trigger(p,key); return; }
 
-    if(!strcmp(key,"current_preset")){ load_preset(p, clampi(atoi(val),1,NUM_PRESETS)); return; }
+    if(!strcmp(key,"current_preset")){ int idx=clampi(atoi(val),1,NUM_PRESETS);
+        p->current_preset=idx; p->pending_preset=idx;
+        if(p->rnd_phase==0||p->rnd_phase==2) p->rnd_phase=1; return; }
     if(!strcmp(key,"fx_reorder")){
         /* accept "1-2-3-4" label or index */
         int idx=-1; for(int i=0;i<24;i++){ char lb[16]; perm_label(i,lb,sizeof lb);
@@ -1579,6 +1651,14 @@ static void process_block(void *instance, int16_t *buf, int frames){
         e ^= e<<13; e ^= e>>17; e ^= e<<5;            /* xorshift mix */
         p->ent = e;
     }
+    /* randomize/preset DUCK: once the output has faded out, apply the deferred change
+     * during silence (the heavy Clouds swap happens here, unheard), hold, then fade in. */
+    if(p->rnd_phase==1 && p->rnd_gain<=0.02f){
+        apply_pending(p); p->rnd_gain=0.0f;
+        p->rnd_hold=(int)(SR*0.020f); p->rnd_phase=3;
+    } else if(p->rnd_phase==3){
+        p->rnd_hold-=frames; if(p->rnd_hold<=0) p->rnd_phase=2;
+    }
 
     /* feedback gain curve: fb_sm^2 keeps the low range gentle; ×(0.85..1.15)
      * pushes just past unity at the top so it self-oscillates (soft-clipped). */
@@ -1641,6 +1721,9 @@ static void process_block(void *instance, int16_t *buf, int frames){
     /* equal-power dry/wet + write back (NaN-guarded — many effects feed back).
      * The wet chain output is stashed as next block's feedback source. */
     float a=p->mix_sm*1.5707963f, dg=cosf(a), wg=sinf(a);
+    float rtgt=(p->rnd_phase==1||p->rnd_phase==3)?0.0f:1.0f;   /* duck target */
+    float rcoef=(p->rnd_phase==2)?0.0016f:0.006f;              /* fade-in slower than out */
+    float rgn=p->rnd_gain;
     for(int i=0;i<frames;i++){
         float wl=p->L[i], wr=p->R[i];
         if(wl!=wl) wl=0.0f; if(wr!=wr) wr=0.0f;
@@ -1648,11 +1731,14 @@ static void process_block(void *instance, int16_t *buf, int frames){
         float ol=dg*dryL[i]+wg*wl;
         float orr=dg*dryR[i]+wg*wr;
         if(ol!=ol) ol=0.0f; if(orr!=orr) orr=0.0f;
+        rgn += rcoef*(rtgt-rgn); ol*=rgn; orr*=rgn; /* duck envelope */
         int32_t il=(int32_t)(ol*32767.0f), ir=(int32_t)(orr*32767.0f);
         if(il>32767)il=32767; if(il<-32768)il=-32768;
         if(ir>32767)ir=32767; if(ir<-32768)ir=-32768;
         buf[2*i]=(int16_t)il; buf[2*i+1]=(int16_t)ir;
     }
+    p->rnd_gain=rgn;
+    if(p->rnd_phase==2 && rgn>0.995f){ p->rnd_gain=1.0f; p->rnd_phase=0; }
 }
 
 /* ── MIDI: derive Move tempo from host clock (24 PPQN). Only used when GLOBAL
