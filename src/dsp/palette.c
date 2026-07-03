@@ -194,6 +194,7 @@ typedef struct {
     int    time_div;          /* 0 = Free, else index into DIVS[] */
     float  fbL[MAXFRAMES], fbR[MAXFRAMES];  /* feedback buffer (prev block out) */
     float  fb_lp_l, fb_lp_r;  /* feedback-path damping LP state */
+    float  fb_hp_l, fb_hp_r;  /* feedback-path DC/sub high-pass state */
     /* Move clock tracking (derive BPM from MIDI clock pulses) */
     uint32_t sample_pos;          /* running sample counter */
     uint32_t last_clock_sample;   /* sample index at last quarter-note boundary */
@@ -498,22 +499,22 @@ static void fx_vibrato(slot_dsp_t *s, float *l, float *r, int n,
     float depth=SR*0.0005f*(0.3f+amount*4.0f);       /* mod depth in samples */
     float base=SR*0.006f;
     float fmRate=rate*1.61f;                          /* incommensurate 2nd LFO */
-    float fmDepth=0.4f+drift*0.6f;                    /* through-zero FM amount */
+    float fmDepth=0.2f+drift*0.35f;                   /* through-zero FM amount (tamed) */
     for(int i=0;i<n;i++){
         s->lfo2+=fmRate/SR; if(s->lfo2>=1.0f)s->lfo2-=1.0f;
         s->lfo+=(rate*(1.0f+fmDepth*0.5f*sinf(s->lfo2*TWO_PI)))/SR;  /* through-zero FM */
         if(s->lfo>=1.0f)s->lfo-=1.0f; if(s->lfo<0.0f)s->lfo+=1.0f;
         float phR=s->lfo+0.25f; if(phR>=1.0f)phR-=1.0f;   /* R 90° offset = stereo */
-        float rndL=(drift>0.0f? wander(&s->f1,&s->seed,0.02f):0.0f);
-        float rndR=(drift>0.0f? wander(&s->f3,&s->seed,0.02f):0.0f);
+        float rndL=(drift>0.0f? wander(&s->f1,&s->seed,0.008f):0.0f);
+        float rndR=(drift>0.0f? wander(&s->f3,&s->seed,0.008f):0.0f);
         float modL=lerpf(sinf(s->lfo*TWO_PI),rndL,clampf(drift,0.0f,0.9f));
         float modR=lerpf(sinf(phR*TWO_PI),    rndR,clampf(drift,0.0f,0.9f));
         float dL=base+depth*(1.0f+modL), dR=base+depth*(1.0f+modR);
         s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
         float oL=dlr(s->dl_l,s->wp,dL), oR=dlr(s->dl_r,s->wp,dR);
         /* HF restore: high-shelf the interpolation loss back in */
-        s->z1l+=0.4f*(oL-s->z1l)+DENORM; oL+=(oL-s->z1l)*0.25f;
-        s->z1r+=0.4f*(oR-s->z1r)+DENORM; oR+=(oR-s->z1r)*0.25f;
+        s->z1l+=0.4f*(oL-s->z1l)+DENORM; oL+=(oL-s->z1l)*0.10f;
+        s->z1r+=0.4f*(oR-s->z1r)+DENORM; oR+=(oR-s->z1r)*0.10f;
         l[i]=oL; r[i]=oR;
         s->wp=(s->wp+1)%MAX_DELAY;
     }
@@ -1085,7 +1086,10 @@ static void rnd_patch(palette_t *p){                 /* everything new */
 static void rnd_effect(palette_t *p){ pick_distinct_effects(p,&p->rng); }   /* keep params */
 static void rnd_amount(palette_t *p){ for(int s=0;s<NUM_SLOTS;s++) p->slots[s].amount=frand(&p->rng); }
 static void rnd_macro (palette_t *p){ for(int s=0;s<NUM_SLOTS;s++) p->slots[s].macro =frand(&p->rng); }
-static void rnd_drift (palette_t *p){ for(int s=0;s<NUM_SLOTS;s++) p->slots[s].drift =frand(&p->rng); }
+/* Rnd Values — randomize all three params (Amount+Macro+Drift) on every slot at
+ * once, KEEPING the current effects. The "tweak the random chain" workflow. */
+static void rnd_values(palette_t *p){ for(int s=0;s<NUM_SLOTS;s++){
+    p->slots[s].amount=frand(&p->rng); p->slots[s].macro=frand(&p->rng); p->slots[s].drift=frand(&p->rng); } }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  PRESETS — 25 factory patches. Each shows a chain the Chroma physically can't
@@ -1220,7 +1224,7 @@ enum { LV_PRESETS=0, LV_PALETTE, LV_FX12, LV_FX34, LV_GLOBAL, NUM_LEVELS };
 
 /* knob (1..8) → param key, per level. NULL = unused knob. */
 static const char *LEVEL_KNOBS[NUM_LEVELS][8] = {
-  /* Presets */ {"current_preset","rnd_patch","rnd_effect","rnd_amount","rnd_macro","rnd_drift","input_vol","mix"},
+  /* Presets */ {"current_preset","rnd_patch","rnd_effect","rnd_amount","rnd_macro","rnd_values","input_vol","mix"},
   /* PALETTE */ {"fx1_amount","fx1_macro","fx2_amount","fx2_macro","fx3_amount","fx3_macro","fx4_amount","fx4_macro"},
   /* FX12    */ {"fx1_select","fx1_amount","fx1_macro","fx1_drift","fx2_select","fx2_amount","fx2_macro","fx2_drift"},
   /* FX34    */ {"fx3_select","fx3_amount","fx3_macro","fx3_drift","fx4_select","fx4_amount","fx4_macro","fx4_drift"},
@@ -1266,7 +1270,7 @@ static void fire_trigger(palette_t *p, const char *key){
     else if(!strcmp(key,"rnd_effect")) rnd_effect(p);
     else if(!strcmp(key,"rnd_amount")) rnd_amount(p);
     else if(!strcmp(key,"rnd_macro"))  rnd_macro(p);
-    else if(!strcmp(key,"rnd_drift"))  rnd_drift(p);
+    else if(!strcmp(key,"rnd_values"))  rnd_values(p);
 }
 
 /* knob delta dispatch (page-aware) */
@@ -1290,9 +1294,11 @@ static void apply_knob_delta(palette_t *p, const char *key, int delta){
     if(!strcmp(key,"tempo_src")){ p->tempo_src = (delta>0)?1:(delta<0?0:p->tempo_src); return; }
     if(!strcmp(key,"tempo_bpm")){ p->tempo_bpm = clampi(p->tempo_bpm+delta,10,500); return; }
     if(!strcmp(key,"time_div")){ p->time_div = clampi(p->time_div+delta,0,NUM_DIVS-1); return; }
-    /* floats */
-    float step = 0.01f;
-    set_float_key(p,key, get_float_key(p,key)+delta*step);
+    /* floats — accelerated: fine (~1.3%) when turned slowly, big jumps on a fast
+     * spin (the host sends larger |delta| when spun quickly) → full sweep in one brisk turn. */
+    float d=(float)delta, mag=fabsf(d);
+    float step=0.013f + 0.006f*(mag-1.0f); if(step>0.07f) step=0.07f;
+    set_float_key(p,key, get_float_key(p,key)+d*step);
 }
 
 static void set_param(void *instance, const char *key, const char *val){
@@ -1402,8 +1408,8 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
           "\"knobs\":[\"fx1_amount\",\"fx1_macro\",\"fx2_amount\",\"fx2_macro\",\"fx3_amount\",\"fx3_macro\",\"fx4_amount\",\"fx4_macro\"],"
           "\"params\":[\"fx1_amount\",\"fx1_macro\",\"fx2_amount\",\"fx2_macro\",\"fx3_amount\",\"fx3_macro\",\"fx4_amount\",\"fx4_macro\"]},"
           "\"Presets\":{\"name\":\"PRESETS&RND\","
-          "\"knobs\":[\"current_preset\",\"rnd_patch\",\"rnd_effect\",\"rnd_amount\",\"rnd_macro\",\"rnd_drift\",\"input_vol\",\"mix\"],"
-          "\"params\":[\"current_preset\",\"rnd_patch\",\"rnd_effect\",\"rnd_amount\",\"rnd_macro\",\"rnd_drift\",\"input_vol\",\"mix\",\"fx_reorder\"]},"
+          "\"knobs\":[\"current_preset\",\"rnd_patch\",\"rnd_effect\",\"rnd_amount\",\"rnd_macro\",\"rnd_values\",\"input_vol\",\"mix\"],"
+          "\"params\":[\"current_preset\",\"rnd_patch\",\"rnd_effect\",\"rnd_amount\",\"rnd_macro\",\"rnd_values\",\"input_vol\",\"mix\",\"fx_reorder\"]},"
           "\"FX12\":{\"name\":\"FX 1&2\","
           "\"knobs\":[\"fx1_select\",\"fx1_amount\",\"fx1_macro\",\"fx1_drift\",\"fx2_select\",\"fx2_amount\",\"fx2_macro\",\"fx2_drift\"],"
           "\"params\":[\"fx1_select\",\"fx1_amount\",\"fx1_macro\",\"fx1_drift\",\"fx2_select\",\"fx2_amount\",\"fx2_macro\",\"fx2_drift\"]},"
@@ -1428,7 +1434,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
             for(int i=0;i<PFX_COUNT;i++) o+=snprintf(buf+o,buf_len-o,"%s\"%s\"",i?",":"",FX_NAMES[i]);
             o+=snprintf(buf+o,buf_len-o,"]},");
             o+=snprintf(buf+o,buf_len-o,
-              "{\"key\":\"fx%d_amount\",\"name\":\"FX%d Amt\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
+              "{\"key\":\"fx%d_amount\",\"name\":\"FX%d Amount\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
               "{\"key\":\"fx%d_macro\",\"name\":\"FX%d Macro\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
               "{\"key\":\"fx%d_drift\",\"name\":\"FX%d Drift\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},",
               s,s,s,s,s,s);
@@ -1446,7 +1452,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
           "{\"key\":\"rnd_effect\",\"name\":\"Rnd FX\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},"
           "{\"key\":\"rnd_amount\",\"name\":\"Rnd Amt\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},"
           "{\"key\":\"rnd_macro\",\"name\":\"Rnd Macro\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},"
-          "{\"key\":\"rnd_drift\",\"name\":\"Rnd Drift\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},");
+          "{\"key\":\"rnd_values\",\"name\":\"Rnd Values\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},");
         /* FX Reorder — menu-only enum of all 24 chain permutations */
         o+=snprintf(buf+o,buf_len-o,"{\"key\":\"fx_reorder\",\"name\":\"FX Reorder\",\"type\":\"enum\",\"options\":[");
         for(int i=0;i<24;i++){ char lb[16]; perm_label(i,lb,sizeof lb);
@@ -1491,8 +1497,8 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
         if(strstr(key,"_name")){
             /* friendly labels */
             if(slot_of(pk)>=0){ const char*f=pk+4; int sl=slot_of(pk)+1;
-                if(!strcmp(f,"select")) return snprintf(buf,buf_len,"FX%d",sl);
-                if(!strcmp(f,"amount")) return snprintf(buf,buf_len,"FX%d Amt",sl);
+                if(!strcmp(f,"select")) return snprintf(buf,buf_len,"FX%d Select",sl);
+                if(!strcmp(f,"amount")) return snprintf(buf,buf_len,"FX%d Amount",sl);
                 if(!strcmp(f,"macro"))  return snprintf(buf,buf_len,"FX%d Macro",sl);
                 if(!strcmp(f,"drift"))  return snprintf(buf,buf_len,"FX%d Drift",sl);
             }
@@ -1503,7 +1509,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
             if(!strcmp(pk,"rnd_effect"))     return snprintf(buf,buf_len,"Rnd FX");
             if(!strcmp(pk,"rnd_amount"))     return snprintf(buf,buf_len,"Rnd Amt");
             if(!strcmp(pk,"rnd_macro"))      return snprintf(buf,buf_len,"Rnd Macro");
-            if(!strcmp(pk,"rnd_drift"))      return snprintf(buf,buf_len,"Rnd Drift");
+            if(!strcmp(pk,"rnd_values"))      return snprintf(buf,buf_len,"Rnd Values");
             if(!strcmp(pk,"feedback"))       return snprintf(buf,buf_len,"Feedback");
             if(!strcmp(pk,"tempo_src"))      return snprintf(buf,buf_len,"Tempo Src");
             if(!strcmp(pk,"tempo_bpm"))      return snprintf(buf,buf_len,"Tempo");
@@ -1546,7 +1552,7 @@ static void process_block(void *instance, int16_t *buf, int frames){
     if(frames>MAXFRAMES) frames=MAXFRAMES;
 
     const uint8_t *order = PERM[clampi(p->fx_reorder,0,23)];
-    float gsm = 1.0f - expf(-(float)frames/(0.020f*SR));     /* 20 ms smooth for globals */
+    float gsm = 1.0f - expf(-(float)frames/(0.015f*SR));     /* 15 ms smooth for globals */
     p->iv_sm  += gsm*(p->input_vol - p->iv_sm);
     p->mix_sm += gsm*(p->mix       - p->mix_sm);
     p->fb_sm  += gsm*(p->feedback  - p->fb_sm);
@@ -1574,15 +1580,23 @@ static void process_block(void *instance, int16_t *buf, int frames){
         p->ent = e;
     }
 
+    /* feedback gain curve: fb_sm^2 keeps the low range gentle; ×(0.85..1.15)
+     * pushes just past unity at the top so it self-oscillates (soft-clipped). */
+    float fgain = p->fb_sm*p->fb_sm*(0.85f + 0.30f*p->fb_sm);
     /* de-interleave + input volume + global feedback send (damped + soft-clipped) */
     float dryL[MAXFRAMES], dryR[MAXFRAMES];
     for(int i=0;i<frames;i++){
         float l=buf[2*i]/32768.0f, r=buf[2*i+1]/32768.0f;
         dryL[i]=l; dryR[i]=r;
-        p->fb_lp_l += 0.3f*(p->fbL[i]-p->fb_lp_l)+DENORM;   /* damp the regen path */
-        p->fb_lp_r += 0.3f*(p->fbR[i]-p->fb_lp_r)+DENORM;
-        float fbl=sb_tanh(p->fb_lp_l*p->fb_sm*1.1f);        /* bounded regeneration */
-        float fbr=sb_tanh(p->fb_lp_r*p->fb_sm*1.1f);
+        /* DC/sub high-pass first (stops rumble building to a rail or cancelling to
+         * silence), then tone-damping LP, then a curved gain: gentle across the low
+         * range, crossing unity at the top for a soft-limited self-oscillating drone. */
+        p->fb_hp_l += 0.0012f*(p->fbL[i]-p->fb_hp_l); float hpl=p->fbL[i]-p->fb_hp_l;
+        p->fb_hp_r += 0.0012f*(p->fbR[i]-p->fb_hp_r); float hpr=p->fbR[i]-p->fb_hp_r;
+        p->fb_lp_l += 0.35f*(hpl-p->fb_lp_l)+DENORM;        /* tone damping */
+        p->fb_lp_r += 0.35f*(hpr-p->fb_lp_r)+DENORM;
+        float fbl=sb_tanh(p->fb_lp_l*fgain);                /* soft-limited regeneration */
+        float fbr=sb_tanh(p->fb_lp_r*fgain);
         p->L[i]=l*iv+fbl; p->R[i]=r*iv+fbr;
     }
     /* run the 4 slots in reorder sequence (Off = passthrough, never dispatched).
@@ -1590,7 +1604,7 @@ static void process_block(void *instance, int16_t *buf, int frames){
      * vtable. Per-slot 20 ms analog-style smoothing of amount/macro/drift (no zipper
      * on knob moves or preset/random loads). A just-switched slot fades input→output
      * over ~25 ms with a smoothstep curve (click-free switching). */
-    const float psm = 1.0f - expf(-(float)frames/(0.020f*SR));   /* 20 ms param smooth */
+    const float psm = 1.0f - expf(-(float)frames/(0.015f*SR));   /* 15 ms param smooth */
     const float ramp_inc = 1.0f / (SR * 0.025f);                 /* 25 ms switch fade */
     float preL[MAXFRAMES], preR[MAXFRAMES];
     for(int k=0;k<NUM_SLOTS;k++){

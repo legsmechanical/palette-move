@@ -83,7 +83,7 @@
             "rnd_effect",
             "rnd_amount",
             "rnd_macro",
-            "rnd_drift",
+            "rnd_values",
             "input_vol",
             "mix"
           ],
@@ -93,7 +93,7 @@
             "rnd_effect",
             "rnd_amount",
             "rnd_macro",
-            "rnd_drift",
+            "rnd_values",
             "input_vol",
             "mix",
             "fx_reorder"
@@ -165,7 +165,7 @@
     "chain_params": [
       {
         "key": "fx1_select",
-        "name": "FX1",
+        "name": "FX1 Select",
         "type": "enum",
         "options": [
           "Off",
@@ -197,7 +197,7 @@
       },
       {
         "key": "fx1_amount",
-        "name": "FX1 Amt",
+        "name": "FX1 Amount",
         "type": "float",
         "min": 0,
         "max": 1,
@@ -221,7 +221,7 @@
       },
       {
         "key": "fx2_select",
-        "name": "FX2",
+        "name": "FX2 Select",
         "type": "enum",
         "options": [
           "Off",
@@ -253,7 +253,7 @@
       },
       {
         "key": "fx2_amount",
-        "name": "FX2 Amt",
+        "name": "FX2 Amount",
         "type": "float",
         "min": 0,
         "max": 1,
@@ -277,7 +277,7 @@
       },
       {
         "key": "fx3_select",
-        "name": "FX3",
+        "name": "FX3 Select",
         "type": "enum",
         "options": [
           "Off",
@@ -309,7 +309,7 @@
       },
       {
         "key": "fx3_amount",
-        "name": "FX3 Amt",
+        "name": "FX3 Amount",
         "type": "float",
         "min": 0,
         "max": 1,
@@ -333,7 +333,7 @@
       },
       {
         "key": "fx4_select",
-        "name": "FX4",
+        "name": "FX4 Select",
         "type": "enum",
         "options": [
           "Off",
@@ -365,7 +365,7 @@
       },
       {
         "key": "fx4_amount",
-        "name": "FX4 Amt",
+        "name": "FX4 Amount",
         "type": "float",
         "min": 0,
         "max": 1,
@@ -528,8 +528,8 @@
         ]
       },
       {
-        "key": "rnd_drift",
-        "name": "Rnd Drift",
+        "key": "rnd_values",
+        "name": "Rnd Values",
         "type": "enum",
         "options": [
           "0",
