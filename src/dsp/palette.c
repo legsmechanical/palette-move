@@ -110,15 +110,13 @@ static const char *FX_NAMES[PFX_COUNT] = {
     "Cascade","Reels","Collage","Reverse","Space","Bloom",
     "Filter","Squash","Cassette","Broken","Interference","Halo"
 };
-static const uint8_t FX_GROUP[PFX_COUNT] = {
-    0, 0,0,0,0,0,0, 1,1,1,1,1,1, 2,2,2,2,2,2, 3,3,3,3,3,3
-};
 
 /* ── Clouds C++ effects (fx_clouds.cc) — SPACE / BLOOM / FREEZE ───────────────
  * Fully isolated behind 3 opaque calls; palette.c never sees Clouds internals.
  * alloc returns heavy state (or NULL on OOM), freed on switch/destroy. */
 extern void *pfx_clouds_alloc(int fx_id, float sr);
 extern void  pfx_clouds_free(void *heavy);
+extern void  pfx_clouds_reset(void *heavy);
 extern void  pfx_clouds_process(int fx_id, void *heavy, float *l, float *r, int n,
                                 float amount, float macro, float drift);
 
@@ -218,6 +216,9 @@ typedef struct {
     float  clock_interval_sm;     /* smoothed samples per quarter */
     int    clock_running;         /* transport running (0xFA/0xFB/0xFC) */
     float  move_bpm;              /* BPM derived from Move clock */
+    /* pre-allocated heavy Clouds engines (SPACE/BLOOM) — one each per instance,
+     * referenced by whichever slot holds them. No audio-thread malloc. */
+    void  *space_pool, *bloom_pool;
     /* scratch buffers for slot processing (per block) */
     float  L[MAXFRAMES], R[MAXFRAMES];
 } palette_t;
@@ -553,7 +554,7 @@ static void fx_phaser(slot_dsp_t *s, float *l, float *r, int n,
             /* quadrature LFO: R is 90° ahead of L → fully stereo sweep */
             float ph=s->lfo + (ch?0.25f:0.0f); if(ph>=1.0f)ph-=1.0f;
             float sweep=0.5f+0.5f*sinf(ph*TWO_PI)+rnd;
-            float fc=200.0f*powf(16.0f,clampf(sweep,0.0f,1.0f));/* 200 Hz .. 3.2 kHz */
+            float fc=200.0f*exp2f(4.0f*clampf(sweep,0.0f,1.0f)); /* 16^x = 2^(4x), exact + cheaper */
             float g=tanf(3.14159265f*clampf(fc,30.0f,12000.0f)/SR);
             float coef=(g-1.0f)/(g+1.0f);                       /* allpass coefficient */
             float *ap=ch?s->ap_r:s->ap_l; float *fbz=ch?&s->z2r:&s->z2l;
@@ -584,7 +585,7 @@ static void fx_tremolo(slot_dsp_t *s, float *l, float *r, int n,
         s->sm1=((s->sm1*speedSpeed)+speedChase)/(speedSpeed+1.0f);
         s->sm2=((s->sm2*depthSpeed)+depthChase)/(depthSpeed+1.0f);
         float speed=(s->sync_rate>0.0f)? s->sync_rate*TWO_PI/SR : 0.0001f+(s->sm1/1000.0f);
-        float skew=1.0f+powf(s->sm2,9.0f);
+        float s2=s->sm2*s->sm2, s4=s2*s2; float skew=1.0f+s->sm2*s4*s4; /* sm2^9 via mults */
         float density=((1.0f-s->sm2)*2.0f)-1.0f;
         float offset=sinf(s->lfo);
         s->lfo+=speed; if(s->lfo>TWO_PI)s->lfo-=TWO_PI;
@@ -1064,14 +1065,11 @@ static void slot_apply_select(palette_t *p, int slot, int landed){
     if(landed == sl->select) return;
     sl->prev_select = sl->select;
     sl->select = landed;
-    if(sl->dsp.heavy && sl->dsp.heavy_kind != landed){
-        pfx_clouds_free(sl->dsp.heavy);
-        sl->dsp.heavy=NULL; sl->dsp.heavy_kind=0;
-    }
-    if(is_clouds_fx(landed) && !sl->dsp.heavy){
-        sl->dsp.heavy = pfx_clouds_alloc(landed, SR);
-        sl->dsp.heavy_kind = sl->dsp.heavy ? landed : 0;
-    }
+    /* reference the pre-allocated pool (no runtime alloc); reset it fresh when a
+     * slot newly takes it, so no reverb tail carries into the new patch. */
+    void *want = (landed==PFX_SPACE)?p->space_pool : (landed==PFX_BLOOM)?p->bloom_pool : NULL;
+    if(want) pfx_clouds_reset(want);
+    sl->dsp.heavy=want; sl->dsp.heavy_kind = want ? landed : 0;
     slot_reset(sl);                  /* clear scratch (heavy preserved) */
     sl->ramp = 0.0f;                 /* fade in from silence to avoid clicks */
 }
@@ -1255,6 +1253,8 @@ static void *create_instance(const char *module_dir, const char *json){
     p->current_level = 1;                       /* LV_PALETTE — landing mirrors Console knobs */
     seed_urandom(&p->rng, &p->ent);             /* true random from the first tap */
     p->pending_rnd=0; p->pending_preset=-1; p->rnd_gain=1.0f; p->rnd_phase=0; p->rnd_hold=0;
+    p->space_pool = pfx_clouds_alloc(PFX_SPACE, SR);   /* pre-allocate heavy engines */
+    p->bloom_pool = pfx_clouds_alloc(PFX_BLOOM, SR);   /* (NULL-safe: slots passthrough) */
     load_preset(p, 1);                          /* start on Init (Drive→Doubler→Cascade→Filter) */
     if(g_host && g_host->log) g_host->log("[palette] instance created");
     return p;
@@ -1262,9 +1262,10 @@ static void *create_instance(const char *module_dir, const char *json){
 static void destroy_instance(void *instance){
     palette_t *p=(palette_t*)instance; if(!p) return;
     for(int s=0;s<NUM_SLOTS;s++){
-        if(p->slots[s].dsp.heavy) pfx_clouds_free(p->slots[s].dsp.heavy);
-        free(p->slots[s].dsp.dl_l); free(p->slots[s].dsp.dl_r);
+        free(p->slots[s].dsp.dl_l); free(p->slots[s].dsp.dl_r);   /* heavy is a shared pool */
     }
+    if(p->space_pool) pfx_clouds_free(p->space_pool);
+    if(p->bloom_pool) pfx_clouds_free(p->bloom_pool);
     free(p);
 }
 
@@ -1671,8 +1672,8 @@ static void process_block(void *instance, int16_t *buf, int frames){
         /* DC/sub high-pass first (stops rumble building to a rail or cancelling to
          * silence), then tone-damping LP, then a curved gain: gentle across the low
          * range, crossing unity at the top for a soft-limited self-oscillating drone. */
-        p->fb_hp_l += 0.0012f*(p->fbL[i]-p->fb_hp_l); float hpl=p->fbL[i]-p->fb_hp_l;
-        p->fb_hp_r += 0.0012f*(p->fbR[i]-p->fb_hp_r); float hpr=p->fbR[i]-p->fb_hp_r;
+        p->fb_hp_l += 0.0012f*(p->fbL[i]-p->fb_hp_l)+DENORM; float hpl=p->fbL[i]-p->fb_hp_l;
+        p->fb_hp_r += 0.0012f*(p->fbR[i]-p->fb_hp_r)+DENORM; float hpr=p->fbR[i]-p->fb_hp_r;
         p->fb_lp_l += 0.35f*(hpl-p->fb_lp_l)+DENORM;        /* tone damping */
         p->fb_lp_r += 0.35f*(hpr-p->fb_lp_r)+DENORM;
         float fbl=sb_tanh(p->fb_lp_l*fgain);                /* soft-limited regeneration */

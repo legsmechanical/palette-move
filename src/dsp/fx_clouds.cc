@@ -152,6 +152,25 @@ extern "C" void *pfx_clouds_alloc(int fx_id, float sr){
         default:        return NULL;
     }
 }
+/* Reset a pre-allocated heavy engine to a fresh state (called when a slot newly
+ * takes it — no runtime alloc; kills any carried reverb tail). */
+extern "C" void pfx_clouds_reset(void *heavy){
+    if(!heavy) return;
+    HeavyHdr *h=(HeavyHdr*)heavy;
+    if(h->kind==FX_SPACE){
+        SpaceState *st=(SpaceState*)heavy;
+        memset(st->buf,0,sizeof(st->buf));
+        st->verb.Init(st->buf);
+        st->verb.set_input_gain(0.2f); st->verb.set_diffusion(0.625f); st->verb.set_lp(0.7f);
+    } else if(h->kind==FX_BLOOM){
+        BloomState *st=(BloomState*)heavy;
+        memset(st->buf,0,sizeof(st->buf));
+        memset(st->shl,0,sizeof(st->shl)); memset(st->shr,0,sizeof(st->shr));
+        st->shwp=0; st->grpos=0.0f;
+        st->verb.Init(st->buf);
+        st->verb.set_input_gain(0.2f); st->verb.set_diffusion(0.7f); st->verb.set_lp(0.6f);
+    }
+}
 extern "C" void pfx_clouds_free(void *heavy){
     if(!heavy) return;
     HeavyHdr *h=(HeavyHdr*)heavy;
