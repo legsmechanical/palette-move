@@ -50,7 +50,10 @@
               "level": "Global",
               "label": "GLOBAL"
             },
-            "editor"
+            {
+              "key": "editor",
+              "label": "Bank Editor"
+            }
           ]
         },
         "Console": {

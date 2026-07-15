@@ -1519,7 +1519,12 @@ static void set_param(void *instance, const char *key, const char *val){
                 mp=csv_f(mp,&f); p->me.destSel[sk]=clampi((int)f,0,PM_NDEST-1);
                 for(int d=0;d<PM_NDEST;d++){ mp=csv_f(mp,&f); p->me.depth[sk][d]=clampf(f,0,1); }
             }
-            csv_f(mp,&f); p->me.editor_bank=clampi((int)f,0,8);
+            /* If the appended section was TRUNCATED (host state buffer too small),
+             * mp ran off the end and the trailing cells parsed as 0 → depth 0 →
+             * -1 depth = spurious full modulation. Detect (mp==NULL before the
+             * final editor field) and reset to safe no-op defaults instead. */
+            if(!mp){ pm_engine_init(&p->me, SR); }
+            else { csv_f(mp,&f); p->me.editor_bank=clampi((int)f,0,8); }
           }
         }
         return;
@@ -1550,7 +1555,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
           "{\"level\":\"FX12\",\"label\":\"FX 1&2\"},"
           "{\"level\":\"FX34\",\"label\":\"FX 3&4\"},"
           "{\"level\":\"Global\",\"label\":\"GLOBAL\"},"
-          "\"editor\""
+          "{\"key\":\"editor\",\"label\":\"Bank Editor\"}"
           "]},"
           "\"Console\":{\"name\":\"PALETTE\","
           "\"knobs\":[\"fx1_amount\",\"fx1_macro\",\"fx2_amount\",\"fx2_macro\",\"fx3_amount\",\"fx3_macro\",\"fx4_amount\",\"fx4_macro\"],"
