@@ -73,6 +73,8 @@ static const host_api_v1_t *g_host = NULL;
 static inline float clampf(float x, float lo, float hi){ return x<lo?lo:(x>hi?hi:x); }
 static inline int   clampi(int x, int lo, int hi){ return x<lo?lo:(x>hi?hi:x); }
 
+#include "mod.h"    /* modulator + macro engine (pure C, single-TU include) */
+
 static inline float frand(uint32_t *s){               /* xorshift32 → [0,1) */
     uint32_t x=*s; x^=x<<13; x^=x>>17; x^=x<<5; *s=x;
     return (x>>8)*(1.0f/16777216.0f);
@@ -163,6 +165,7 @@ typedef struct {
     int   prev_select;        /* for Skip-walk direction inference */
     float amount, macro, drift;       /* knob targets */
     float amt_sm, mac_sm, drf_sm;     /* 20 ms analog-style smoothed values (fed to DSP) */
+    float mo_amt, mo_mac, mo_drf;     /* per-block modulation offsets (cleared each block) */
     float ramp;               /* 0..1 click-free fade-in after an effect switch */
     slot_dsp_t dsp;
 } slot_t;
@@ -216,6 +219,9 @@ typedef struct {
     float  clock_interval_sm;     /* smoothed samples per quarter */
     int    clock_running;         /* transport running (0xFA/0xFB/0xFC) */
     float  move_bpm;              /* BPM derived from Move clock */
+    /* ── modulation: 3 modulators + 4 macros → DEST+LEVEL routing table ──── */
+    pm_engine_t me;              /* mod/macro engine (see mod.h) */
+    float  mo_mix, mo_fb, mo_iv; /* per-block global mod offsets (cleared each block) */
     /* pre-allocated heavy Clouds engines (SPACE/BLOOM) — one each per instance,
      * referenced by whichever slot holds them. No audio-thread malloc. */
     void  *space_pool, *bloom_pool;
@@ -1253,6 +1259,7 @@ static void *create_instance(const char *module_dir, const char *json){
     p->current_level = 1;                       /* LV_PALETTE — landing mirrors Console knobs */
     seed_urandom(&p->rng, &p->ent);             /* true random from the first tap */
     p->pending_rnd=0; p->pending_preset=-1; p->rnd_gain=1.0f; p->rnd_phase=0; p->rnd_hold=0;
+    pm_engine_init(&p->me, SR);                 /* modulators + macros default to no-op */
     p->space_pool = pfx_clouds_alloc(PFX_SPACE, SR);   /* pre-allocate heavy engines */
     p->bloom_pool = pfx_clouds_alloc(PFX_BLOOM, SR);   /* (NULL-safe: slots passthrough) */
     load_preset(p, 1);                          /* start on Init (Drive→Doubler→Cascade→Filter) */
@@ -1372,6 +1379,17 @@ static void apply_knob_delta(palette_t *p, const char *key, int delta){
     set_float_key(p,key, get_float_key(p,key)+d*step);
 }
 
+/* ── CSV field walkers (used by the appended mod/macro state section) ──────── */
+static const char* csv_skip(const char *s, int n){
+    while(n>0 && s){ const char *c=strchr(s,','); s = c?c+1:NULL; n--; }
+    return s;
+}
+static const char* csv_f(const char *s, float *out){
+    if(!s){ *out=0.0f; return NULL; }
+    *out=(float)atof(s);
+    { const char *c=strchr(s,','); return c?c+1:NULL; }
+}
+
 static void set_param(void *instance, const char *key, const char *val){
     palette_t *p=(palette_t*)instance; if(!p||!key||!val) return;
 
@@ -1425,6 +1443,35 @@ static void set_param(void *instance, const char *key, const char *val){
         if(idx<0) idx=clampi(atoi(val),0,NUM_DIVS-1);
         p->time_div=idx; return;
     }
+    /* ── modulators: m1_.. m3_.. (params, plus dest cursor + level cell) ──────── */
+    if(key[0]=='m' && key[1]>='1' && key[1]<='3' && key[2]=='_'){
+        int mi=key[1]-'1'; pm_mod_t *md=&p->me.mod[mi]; const char *f=key+3;
+        if(!strcmp(f,"mode"))          md->mode=pm_enum_from_str(val,PM_MODE_NAMES,PM_MODE_COUNT);
+        else if(!strcmp(f,"sync"))     md->sync=pm_enum_from_str(val,PM_SYNC_NAMES,PM_SYNC_COUNT);
+        else if(!strcmp(f,"lfo_wave")) md->wave=pm_enum_from_str(val,PM_WAVE_NAMES,PM_WAVE_COUNT);
+        else if(!strcmp(f,"lfo_rate")) md->lfo_rate=clampf((float)atof(val),0,1);
+        else if(!strcmp(f,"lfo_fade")) md->lfo_fade=clampf((float)atof(val),0,1);
+        else if(!strcmp(f,"rnd_rate")) md->rnd_rate=clampf((float)atof(val),0,1);
+        else if(!strcmp(f,"rnd_lag"))  md->rnd_lag =clampf((float)atof(val),0,1);
+        else if(!strcmp(f,"rnd_prob")) md->rnd_prob=clampf((float)atof(val),0,1);
+        else if(!strcmp(f,"env_a"))    md->env_a =clampf((float)atof(val),0,1);
+        else if(!strcmp(f,"env_dr"))   md->env_dr=clampf((float)atof(val),0,1);
+        else if(!strcmp(f,"env_s"))    md->env_s =clampf((float)atof(val),0,1);
+        else if(!strcmp(f,"dest"))     p->me.destSel[mi]=pm_dest_from_str(val);
+        else if(!strcmp(f,"level"))    p->me.depth[mi][p->me.destSel[mi]]=clampf((float)atof(val),0,1);
+        return;
+    }
+    /* ── macros: macro1..macro4 value, macroN_dest cursor, macroN_level cell ──── */
+    if(!strncmp(key,"macro",5) && key[5]>='1' && key[5]<='4'){
+        int gi=key[5]-'1', sk=PM_NUM_MODS+gi; const char *f=key+6;
+        if(*f=='\0')                 p->me.macro[gi]=clampf((float)atof(val),0,1);
+        else if(!strcmp(f,"_dest"))  p->me.destSel[sk]=pm_dest_from_str(val);
+        else if(!strcmp(f,"_level")) p->me.depth[sk][p->me.destSel[sk]]=clampf((float)atof(val),0,1);
+        return;
+    }
+    /* canvas bank editor: persisted current bank index */
+    if(!strcmp(key,"editor")){ p->me.editor_bank=clampi(atoi(val),0,8); return; }
+
     /* full-state restore (per-Set persistence). CSV: 4×(sel,amt,mac,drf),mix,ivol,ord,preset */
     if(!strcmp(key,"state")){
         int sel[4],ord=0,pre=1,tsrc=0,tbpm=120,tdiv=0; float a[4],m[4],d[4],mix=1.0f,iv=1.0f,fb=0.0f;
@@ -1447,6 +1494,33 @@ static void set_param(void *instance, const char *key, const char *val){
             if(got>=20) p->current_preset=clampi(pre,1,NUM_PRESETS);
             if(got>=24){ p->feedback=clampf(fb,0,1); p->tempo_src=clampi(tsrc,0,1);
                          p->tempo_bpm=clampi(tbpm,10,500); p->time_div=clampi(tdiv,0,NUM_DIVS-1); }
+        }
+        /* ── APPENDED mod/macro section (field 24+). Absent in old states → the
+         *    engine keeps its init defaults (all depth cells 0.5 = no-op). ── */
+        { const char *mp=csv_skip(val,24); float f;
+          if(mp && *mp){
+            for(int m=0;m<PM_NUM_MODS;m++){ pm_mod_t *md=&p->me.mod[m];
+                mp=csv_f(mp,&f); md->mode=clampi((int)f,0,PM_MODE_COUNT-1);
+                mp=csv_f(mp,&f); md->sync=clampi((int)f,0,PM_SYNC_COUNT-1);
+                mp=csv_f(mp,&f); md->wave=clampi((int)f,0,PM_WAVE_COUNT-1);
+                mp=csv_f(mp,&f); md->lfo_rate=clampf(f,0,1);
+                mp=csv_f(mp,&f); md->lfo_fade=clampf(f,0,1);
+                mp=csv_f(mp,&f); md->rnd_rate=clampf(f,0,1);
+                mp=csv_f(mp,&f); md->rnd_lag =clampf(f,0,1);
+                mp=csv_f(mp,&f); md->rnd_prob=clampf(f,0,1);
+                mp=csv_f(mp,&f); md->env_a =clampf(f,0,1);
+                mp=csv_f(mp,&f); md->env_dr=clampf(f,0,1);
+                mp=csv_f(mp,&f); md->env_s =clampf(f,0,1);
+                mp=csv_f(mp,&f); p->me.destSel[m]=clampi((int)f,0,PM_NDEST-1);
+                for(int d=0;d<PM_NDEST;d++){ mp=csv_f(mp,&f); p->me.depth[m][d]=clampf(f,0,1); }
+            }
+            for(int g=0;g<PM_NUM_MACROS;g++){ int sk=PM_NUM_MODS+g;
+                mp=csv_f(mp,&f); p->me.macro[g]=clampf(f,0,1);
+                mp=csv_f(mp,&f); p->me.destSel[sk]=clampi((int)f,0,PM_NDEST-1);
+                for(int d=0;d<PM_NDEST;d++){ mp=csv_f(mp,&f); p->me.depth[sk][d]=clampf(f,0,1); }
+            }
+            csv_f(mp,&f); p->me.editor_bank=clampi((int)f,0,8);
+          }
         }
         return;
     }
@@ -1475,7 +1549,8 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
           "{\"level\":\"Presets\",\"label\":\"PRESETS&RND\"},"
           "{\"level\":\"FX12\",\"label\":\"FX 1&2\"},"
           "{\"level\":\"FX34\",\"label\":\"FX 3&4\"},"
-          "{\"level\":\"Global\",\"label\":\"GLOBAL\"}"
+          "{\"level\":\"Global\",\"label\":\"GLOBAL\"},"
+          "\"editor\""
           "]},"
           "\"Console\":{\"name\":\"PALETTE\","
           "\"knobs\":[\"fx1_amount\",\"fx1_macro\",\"fx2_amount\",\"fx2_macro\",\"fx3_amount\",\"fx3_macro\",\"fx4_amount\",\"fx4_macro\"],"
@@ -1539,6 +1614,39 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
         o+=snprintf(buf+o,buf_len-o,"{\"key\":\"time_div\",\"name\":\"Time Div\",\"type\":\"enum\",\"options\":[");
         for(int i=0;i<NUM_DIVS;i++) o+=snprintf(buf+o,buf_len-o,"%s\"%s\"",i?",":"",DIVS[i].name);
         o+=snprintf(buf+o,buf_len-o,"]}");
+        /* ── modulators + macros (edited via the canvas Bank Editor; listed here so
+         *    the shadow/remote UI and host chain editor can reach them too) ──────── */
+        o+=snprintf(buf+o,buf_len-o,
+          ",{\"key\":\"editor\",\"name\":\"Bank Editor\",\"type\":\"canvas\","
+          "\"canvas_script\":\"canvas.js#palette_editor\",\"show_footer\":false,\"show_value\":false}");
+        for(int m=1;m<=PM_NUM_MODS;m++){
+            o+=snprintf(buf+o,buf_len-o,",{\"key\":\"m%d_mode\",\"name\":\"Mod %d Mode\",\"type\":\"enum\",\"options\":[",m,m);
+            for(int i=0;i<PM_MODE_COUNT;i++) o+=snprintf(buf+o,buf_len-o,"%s\"%s\"",i?",":"",PM_MODE_NAMES[i]);
+            o+=snprintf(buf+o,buf_len-o,"]},{\"key\":\"m%d_sync\",\"name\":\"Mod %d Sync\",\"type\":\"enum\",\"options\":[",m,m);
+            for(int i=0;i<PM_SYNC_COUNT;i++) o+=snprintf(buf+o,buf_len-o,"%s\"%s\"",i?",":"",PM_SYNC_NAMES[i]);
+            o+=snprintf(buf+o,buf_len-o,"]},{\"key\":\"m%d_lfo_wave\",\"name\":\"Mod %d Wave\",\"type\":\"enum\",\"options\":[",m,m);
+            for(int i=0;i<PM_WAVE_COUNT;i++) o+=snprintf(buf+o,buf_len-o,"%s\"%s\"",i?",":"",PM_WAVE_NAMES[i]);
+            o+=snprintf(buf+o,buf_len-o,"]}");
+            o+=snprintf(buf+o,buf_len-o,
+              ",{\"key\":\"m%d_lfo_rate\",\"name\":\"Mod %d Rate\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01}"
+              ",{\"key\":\"m%d_lfo_fade\",\"name\":\"Mod %d Fade\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01}"
+              ",{\"key\":\"m%d_rnd_rate\",\"name\":\"Mod %d Rnd Rate\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01}"
+              ",{\"key\":\"m%d_rnd_lag\",\"name\":\"Mod %d Rnd Lag\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01}"
+              ",{\"key\":\"m%d_rnd_prob\",\"name\":\"Mod %d Rnd Prob\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01}"
+              ",{\"key\":\"m%d_env_a\",\"name\":\"Mod %d Atk\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01}"
+              ",{\"key\":\"m%d_env_dr\",\"name\":\"Mod %d Dec/Rel\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01}"
+              ",{\"key\":\"m%d_env_s\",\"name\":\"Mod %d Sus\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01}",
+              m,m,m,m,m,m,m,m,m,m,m,m,m,m,m,m);
+            o+=snprintf(buf+o,buf_len-o,",{\"key\":\"m%d_dest\",\"name\":\"Mod %d Dest\",\"type\":\"enum\",\"options\":[",m,m);
+            o+=pm_dest_labels_json(buf+o,buf_len-o);
+            o+=snprintf(buf+o,buf_len-o,"]},{\"key\":\"m%d_level\",\"name\":\"Mod %d Level\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01}",m,m);
+        }
+        for(int g=1;g<=PM_NUM_MACROS;g++){
+            o+=snprintf(buf+o,buf_len-o,",{\"key\":\"macro%d\",\"name\":\"Macro %d\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01}",g,g);
+            o+=snprintf(buf+o,buf_len-o,",{\"key\":\"macro%d_dest\",\"name\":\"Macro %d Dest\",\"type\":\"enum\",\"options\":[",g,g);
+            o+=pm_dest_labels_json(buf+o,buf_len-o);
+            o+=snprintf(buf+o,buf_len-o,"]},{\"key\":\"macro%d_level\",\"name\":\"Macro %d Level\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01}",g,g);
+        }
         o+=snprintf(buf+o,buf_len-o,"]");
         return o;
     }
@@ -1562,6 +1670,36 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
     if(!strcmp(key,"fx_reorder")){ char lb[16]; perm_label(p->fx_reorder,lb,sizeof lb);
                                    return snprintf(buf,buf_len,"%s",lb); }
     if(!strncmp(key,"rnd_",4))       return snprintf(buf,buf_len,"0");   /* triggers read 0 */
+
+    /* ── modulators (m1_.. m3_..): enums as labels, floats raw, dest as label ── */
+    if(key[0]=='m' && key[1]>='1' && key[1]<='3' && key[2]=='_'){
+        int mi=key[1]-'1'; pm_mod_t *md=&p->me.mod[mi]; const char *f=key+3;
+        if(!strcmp(f,"mode"))     return snprintf(buf,buf_len,"%s",PM_MODE_NAMES[clampi(md->mode,0,PM_MODE_COUNT-1)]);
+        if(!strcmp(f,"sync"))     return snprintf(buf,buf_len,"%s",PM_SYNC_NAMES[clampi(md->sync,0,PM_SYNC_COUNT-1)]);
+        if(!strcmp(f,"lfo_wave")) return snprintf(buf,buf_len,"%s",PM_WAVE_NAMES[clampi(md->wave,0,PM_WAVE_COUNT-1)]);
+        if(!strcmp(f,"lfo_rate")) return snprintf(buf,buf_len,"%.4f",md->lfo_rate);
+        if(!strcmp(f,"lfo_fade")) return snprintf(buf,buf_len,"%.4f",md->lfo_fade);
+        if(!strcmp(f,"rnd_rate")) return snprintf(buf,buf_len,"%.4f",md->rnd_rate);
+        if(!strcmp(f,"rnd_lag"))  return snprintf(buf,buf_len,"%.4f",md->rnd_lag);
+        if(!strcmp(f,"rnd_prob")) return snprintf(buf,buf_len,"%.4f",md->rnd_prob);
+        if(!strcmp(f,"env_a"))    return snprintf(buf,buf_len,"%.4f",md->env_a);
+        if(!strcmp(f,"env_dr"))   return snprintf(buf,buf_len,"%.4f",md->env_dr);
+        if(!strcmp(f,"env_s"))    return snprintf(buf,buf_len,"%.4f",md->env_s);
+        if(!strcmp(f,"dest")){ char lbl[32]; pm_dest_label(p->me.destSel[mi],lbl,sizeof lbl);
+                               return snprintf(buf,buf_len,"%s",lbl); }
+        if(!strcmp(f,"level"))    return snprintf(buf,buf_len,"%.4f",p->me.depth[mi][p->me.destSel[mi]]);
+        return -1;
+    }
+    /* ── macros (macro1..macro4 value, macroN_dest label, macroN_level cell) ──── */
+    if(!strncmp(key,"macro",5) && key[5]>='1' && key[5]<='4'){
+        int gi=key[5]-'1', sk=PM_NUM_MODS+gi; const char *f=key+6;
+        if(*f=='\0')             return snprintf(buf,buf_len,"%.4f",p->me.macro[gi]);
+        if(!strcmp(f,"_dest")){ char lbl[32]; pm_dest_label(p->me.destSel[sk],lbl,sizeof lbl);
+                                return snprintf(buf,buf_len,"%s",lbl); }
+        if(!strcmp(f,"_level"))  return snprintf(buf,buf_len,"%.4f",p->me.depth[sk][p->me.destSel[sk]]);
+        return -1;
+    }
+    if(!strcmp(key,"editor"))       return snprintf(buf,buf_len,"%d",p->me.editor_bank);
 
     /* knob_N_name / knob_N_value — page-aware via current level */
     if(!strncmp(key,"knob_",5) && (strstr(key,"_name")||strstr(key,"_value"))){
@@ -1611,10 +1749,74 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
             p->mix,p->input_vol,p->fx_reorder,p->current_preset);
         o+=snprintf(buf+o,buf_len-o,",%.4f,%d,%d,%d",
             p->feedback,p->tempo_src,p->tempo_bpm,p->time_div);  /* GLOBAL */
+        /* ── APPENDED mod/macro section (old states lack it → defaults on load) ── */
+        for(int m=0;m<PM_NUM_MODS;m++){ pm_mod_t *md=&p->me.mod[m];
+            o+=snprintf(buf+o,buf_len-o,",%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d",
+                md->mode,md->sync,md->wave,md->lfo_rate,md->lfo_fade,
+                md->rnd_rate,md->rnd_lag,md->rnd_prob,md->env_a,md->env_dr,md->env_s,
+                p->me.destSel[m]);
+            for(int d=0;d<PM_NDEST;d++) o+=snprintf(buf+o,buf_len-o,",%.4f",p->me.depth[m][d]);
+        }
+        for(int g=0;g<PM_NUM_MACROS;g++){ int sk=PM_NUM_MODS+g;
+            o+=snprintf(buf+o,buf_len-o,",%.4f,%d",p->me.macro[g],p->me.destSel[sk]);
+            for(int d=0;d<PM_NDEST;d++) o+=snprintf(buf+o,buf_len-o,",%.4f",p->me.depth[sk][d]);
+        }
+        o+=snprintf(buf+o,buf_len-o,",%d",p->me.editor_bank);
         return o;
     }
 
     return -1;   /* unknown key MUST be -1, never 0 */
+}
+
+/* ── modulation apply: advance the 3 modulators, then distribute the DEST+LEVEL
+ *  depth table into per-slot / global offsets (mo_*), block-rate. Two passes so a
+ *  source can scale a modulator's whole output ("Mod N Level" = a macro fading an
+ *  LFO in/out): pass 1 gathers rate + level cross-mod, pass 2 distributes each
+ *  source's slot/global contribution scaled by that level. rateOffs is applied
+ *  one block late (written back here, read by next block's recompute). ─────────── */
+static void apply_modulation(palette_t *p, float bpm, int frames){
+    pm_engine_t *e = &p->me;
+    int gate = e->held_notes > 0;
+    for(int s=0;s<NUM_SLOTS;s++){ p->slots[s].mo_amt=0; p->slots[s].mo_mac=0; p->slots[s].mo_drf=0; }
+    p->mo_mix=0; p->mo_fb=0; p->mo_iv=0;
+
+    for(int m=0;m<PM_NUM_MODS;m++){
+        pm_mod_recompute(&e->mod[m], bpm, SR);        /* uses previous block's rateOffs */
+        pm_mod_tick_block(&e->mod[m], frames, SR, gate);
+    }
+    float rateOffs[PM_NUM_MODS]={0};
+    float levelScale[PM_NUM_MODS]; for(int m=0;m<PM_NUM_MODS;m++) levelScale[m]=1.0f;
+
+    /* pass 1: cross-mod dests (Mod N Rate / Mod N Level) */
+    for(int k=0;k<PM_NUM_SRC;k++){
+        float v = (k<PM_NUM_MODS)? e->mod[k].value : e->macro[k-PM_NUM_MODS];
+        for(int d=PM_DEST_RATE_BASE; d<PM_NDEST; d++){
+            float dep=(e->depth[k][d]-0.5f)*2.0f;
+            if(dep>-0.005f && dep<0.005f) continue;
+            float amt=v*dep;
+            if(d<PM_DEST_LEVEL_BASE) rateOffs[d-PM_DEST_RATE_BASE]  += amt;
+            else                     levelScale[d-PM_DEST_LEVEL_BASE]+= amt;
+        }
+    }
+    for(int m=0;m<PM_NUM_MODS;m++) levelScale[m]=clampf(levelScale[m],0.0f,2.0f);
+
+    /* pass 2: slot params (1..12) + globals (Mix/Feedback/Input Vol) */
+    for(int k=0;k<PM_NUM_SRC;k++){
+        float v = (k<PM_NUM_MODS)? e->mod[k].value*levelScale[k] : e->macro[k-PM_NUM_MODS];
+        for(int d=1; d<PM_DEST_RATE_BASE; d++){
+            float dep=(e->depth[k][d]-0.5f)*2.0f;
+            if(dep>-0.005f && dep<0.005f) continue;
+            float off=v*dep;
+            if(d<=12){ int s=(d-1)/PM_DEST_PER_SLOT, par=(d-1)%PM_DEST_PER_SLOT;
+                if(par==0)      p->slots[s].mo_amt+=off;
+                else if(par==1) p->slots[s].mo_mac+=off;
+                else            p->slots[s].mo_drf+=off;
+            } else if(d==PM_DEST_MIX) p->mo_mix+=off;
+            else if(d==PM_DEST_FB)    p->mo_fb +=off;
+            else if(d==PM_DEST_IV)    p->mo_iv +=off;   /* input_vol range 0..2, unity 1 */
+        }
+    }
+    for(int m=0;m<PM_NUM_MODS;m++) e->mod[m].rateOffs = rateOffs[m];
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1625,16 +1827,21 @@ static void process_block(void *instance, int16_t *buf, int frames){
     if(frames>MAXFRAMES) frames=MAXFRAMES;
 
     const uint8_t *order = PERM[clampi(p->fx_reorder,0,23)];
-    float gsm = 1.0f - expf(-(float)frames/(0.015f*SR));     /* 15 ms smooth for globals */
-    p->iv_sm  += gsm*(p->input_vol - p->iv_sm);
-    p->mix_sm += gsm*(p->mix       - p->mix_sm);
-    p->fb_sm  += gsm*(p->feedback  - p->fb_sm);
-    float iv = p->iv_sm;
 
-    /* ── tempo sync: effective BPM → synced delay time + LFO rate for this block ── */
+    /* effective BPM — needed by BOTH tempo sync and the modulator rate law */
     float bpm = (p->tempo_src==1) ? (float)p->tempo_bpm
               : ((p->clock_running && p->move_bpm>=10.0f) ? p->move_bpm : (float)p->tempo_bpm);
     bpm = clampf(bpm,10.0f,500.0f);
+
+    /* modulation → mo_* offsets (folded into the smoothers just below + the slot loop) */
+    apply_modulation(p, bpm, frames);
+
+    float gsm = 1.0f - expf(-(float)frames/(0.015f*SR));     /* 15 ms smooth for globals */
+    p->iv_sm  += gsm*(clampf(p->input_vol + p->mo_iv, 0.0f,2.0f) - p->iv_sm);
+    p->mix_sm += gsm*(clampf(p->mix       + p->mo_mix,0.0f,1.0f) - p->mix_sm);
+    p->fb_sm  += gsm*(clampf(p->feedback  + p->mo_fb, 0.0f,1.0f) - p->fb_sm);
+    float iv = p->iv_sm;
+
     float sync_time=0.0f, sync_rate=0.0f;
     if(p->time_div>0){
         float npb=DIVS[clampi(p->time_div,0,NUM_DIVS-1)].npb;
@@ -1692,9 +1899,9 @@ static void process_block(void *instance, int16_t *buf, int frames){
         slot_t *sl=&p->slots[order[k]];
         int fx=sl->select;
         if(fx==PFX_OFF) continue;
-        sl->amt_sm += psm*(sl->amount - sl->amt_sm);
-        sl->mac_sm += psm*(sl->macro  - sl->mac_sm);
-        sl->drf_sm += psm*(sl->drift  - sl->drf_sm);
+        sl->amt_sm += psm*(clampf(sl->amount + sl->mo_amt, 0.0f,1.0f) - sl->amt_sm);
+        sl->mac_sm += psm*(clampf(sl->macro  + sl->mo_mac, 0.0f,1.0f) - sl->mac_sm);
+        sl->drf_sm += psm*(clampf(sl->drift  + sl->mo_drf, 0.0f,1.0f) - sl->drf_sm);
         sl->dsp.sync_time = sync_time;     /* tempo sync (0 = free-running) */
         sl->dsp.sync_rate = sync_rate;
         int ramping = sl->ramp < 1.0f;
@@ -1748,6 +1955,18 @@ static void on_midi(void *instance, const uint8_t *msg, int len, int source){
     palette_t *p=(palette_t*)instance; if(!p||!msg||len<1) return;
     (void)source;
     uint8_t st=msg[0];
+    /* note gating for the modulators (envelope gate + Key/BPM+Key phase reset).
+     * Channel voice messages carry the channel in the low nibble → mask it off. */
+    { uint8_t hi=st&0xF0;
+      if(hi==0x90 && len>=3 && msg[2]>0){                 /* note on */
+          if(p->me.held_notes<=0){ for(int m=0;m<PM_NUM_MODS;m++) pm_mod_note_on(&p->me.mod[m]); }
+          p->me.held_notes++;
+          return;
+      } else if((hi==0x80 && len>=2) || (hi==0x90 && len>=3 && msg[2]==0)){   /* note off */
+          if(p->me.held_notes>0) p->me.held_notes--;
+          return;
+      }
+    }
     if(st==0xFA||st==0xFB){ p->clock_running=1; p->clock_count=0; p->last_clock_sample=p->sample_pos; }
     else if(st==0xFC){ p->clock_running=0; }
     else if(st==0xF8){ /* timing clock — measure samples per quarter (24 pulses) */
