@@ -1418,7 +1418,12 @@ static void set_param(void *instance, const char *key, const char *val){
             int req=PFX_OFF;
             for(int i=0;i<PFX_COUNT;i++) if(!strcmp(val,FX_NAMES[i])){req=i;break;}
             if(req==PFX_OFF && val[0]>='0'&&val[0]<='9') req=clampi(atoi(val),0,NUM_FX);
-            set_slot_select(p,s,req,+1);
+            /* skip-walk in the DIRECTION OF TRAVEL so a down-step skips downward,
+             * not up (the canvas/encoder sends the target index; infer dir from
+             * the delta vs the current effect). Hardcoding +1 made downward moves
+             * land above a taken effect → "won't select, falls back to others". */
+            int dir = (req < p->slots[s].select) ? -1 : +1;
+            set_slot_select(p,s,req,dir);
             return;
         }
     }

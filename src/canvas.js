@@ -614,7 +614,13 @@ const palette_editor = {
       };
       ctx.setParam = function (kk, v) {
         var rr = rawSet.call(ctx, kk, v);
-        ctx._pcache[kk] = String(v);
+        // fx*_select runs the effect-uniqueness SKIP walk in the DSP: the index
+        // we WROTE may not be where it LANDS (a taken effect is skipped). Caching
+        // the requested value desyncs the display + the next step's "current"
+        // read -> erratic selection. Drop it so the next getParam re-reads the
+        // landed effect name.
+        if (/_select$/.test(kk)) delete ctx._pcache[kk];
+        else ctx._pcache[kk] = String(v);
         if (/_dest$/.test(kk)) delete ctx._pcache[kk.slice(0, -5) + "_level"];
         return rr;
       };
