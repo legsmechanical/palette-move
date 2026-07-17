@@ -77,10 +77,11 @@ function fcodec(cell) {
   cell.format = (v) => String(+(v / 100).toFixed(4));
   return cell;
 }
-function funi(key, label) { return fcodec(uni(key, label)); }
+function funi(key, label, name) { const c = fcodec(uni(key, label)); c.name = name; return c; }
 /* Bipolar float (levels, center 0.5): display as a signed percent (+-100). */
-function fbip(key, label) {
+function fbip(key, label, name) {
   const c = fcodec(bip(key, label));
+  c.name = name;
   c.text = (ctx) => {
     const sgn = (getRaw(ctx, c) - 50) * 2;
     return (sgn > 0 ? "+" : "") + sgn;
@@ -88,8 +89,9 @@ function fbip(key, label) {
   return c;
 }
 /* input_vol: float 0..2 wire, unity 1 -> 0..200 int, "1.00" readout. */
-function fvol(key, label) {
+function fvol(key, label, name) {
   const c = uni(key, label);
+  c.name = name;
   c.max = 200; c.dflt = 100;
   c.parse = (raw) => Math.round(parseFloat(raw) * 100);
   c.format = (v) => String(+(v / 100).toFixed(2));
@@ -98,8 +100,9 @@ function fvol(key, label) {
 }
 /* Label-wire enum: get_param returns the option LABEL; writes stay the
  * index (the DSP resolves digit-first). Cached self-writes parse as digits. */
-function lenum(key, label, options, sq) {
+function lenum(key, label, options, sq, name) {
   const c = enumc(key, label, options, sq);
+  c.name = name;
   c.parse = (raw) => {
     const i = options.indexOf(String(raw));
     if (i >= 0) return i;
@@ -108,11 +111,11 @@ function lenum(key, label, options, sq) {
   };
   return c;
 }
-function destc(key, label) { return lenum(key, label, DEST_LABELS, DEST_SQ); }
+function destc(key, label, name) { return lenum(key, label, DEST_LABELS, DEST_SQ, name); }
 /* Macros bank route cursor: a LOCAL UI cell (no engine param) picking which
  * macro's dest/level knobs 5-6 edit. Lives in ctx.state.macroSel. */
 function routec(label) {
-  return { key: null, label, kind: "count", min: 1, max: 4, step: 1, sens: KIT_SENS,
+  return { key: null, label, name: "Edit Route (M1-M4)", kind: "count", min: 1, max: 4, step: 1, sens: KIT_SENS,
     get: (ctx) => (ctx.state.macroSel || 1),
     set: (ctx, v) => { ctx.state.macroSel = v; } };
 }
@@ -120,6 +123,7 @@ function routec(label) {
  * (the DSP clamps 1..25 and loads the preset -> full cache flush below). */
 function presetc(key, label) {
   const c = count(key, label, 1, 25);
+  c.name = "Preset";
   c.get = (ctx) => { const n = parseInt(ctx.getParam(key), 10); return isNaN(n) ? 1 : n; };
   c.set = (ctx, v) => ctx.setParam(key, String(v));
   c.text = (ctx) => String(ctx.getParam(key) || "1 Init");
@@ -133,17 +137,25 @@ function fxBank(n) {
   const pfx = "fx" + n + "_";
   return {
     label: "FX " + n,
-    knobs: [lenum(pfx + "select", "Sel", FX_NAMES),
-            funi(pfx + "amount", "Amt"), funi(pfx + "macro", "Mcro"), funi(pfx + "drift", "Drft")],
+    knobs: [lenum(pfx + "select", "Sel", FX_NAMES, null, "FX " + n + " Select"),
+            funi(pfx + "amount", "Amt", "FX " + n + " Amount"),
+            funi(pfx + "macro", "Mcro", "FX " + n + " Macro"),
+            funi(pfx + "drift", "Drft", "FX " + n + " Drift")],
     header: (ctx) => "FX " + n + ": " + (ctx.getParam(pfx + "select") || "Off")
   };
 }
 
 /* Mode-dependent shape cells (knobs 3-5), re-resolved each render. */
-function modShape(mode, pfx) {
-  if (mode === 1) return [funi(pfx + "env_a", "Atk"), funi(pfx + "env_dr", "D-R"), funi(pfx + "env_s", "Sus")];
-  if (mode === 2) return [funi(pfx + "rnd_rate", "Rate"), funi(pfx + "rnd_lag", "Lag"), funi(pfx + "rnd_prob", "Prob")];
-  return [funi(pfx + "lfo_rate", "Rate"), lenum(pfx + "lfo_wave", "Wave", LFOWAVE_LABELS, LFOWAVE_SQ), funi(pfx + "lfo_fade", "Fade")];
+function modShape(mode, pfx, mn) {
+  if (mode === 1) return [funi(pfx + "env_a", "Atk", mn + " Env Attack"),
+                          funi(pfx + "env_dr", "D-R", mn + " Env Dec/Rel"),
+                          funi(pfx + "env_s", "Sus", mn + " Env Sustain")];
+  if (mode === 2) return [funi(pfx + "rnd_rate", "Rate", mn + " Rnd Rate"),
+                          funi(pfx + "rnd_lag", "Lag", mn + " Rnd Lag"),
+                          funi(pfx + "rnd_prob", "Prob", mn + " Rnd Prob")];
+  return [funi(pfx + "lfo_rate", "Rate", mn + " LFO Rate"),
+          lenum(pfx + "lfo_wave", "Wave", LFOWAVE_LABELS, LFOWAVE_SQ, mn + " LFO Wave"),
+          funi(pfx + "lfo_fade", "Fade", mn + " LFO Fade")];
 }
 function modIndex(ctx, key) {
   const raw = ctx.getParam(key);
@@ -153,13 +165,13 @@ function modIndex(ctx, key) {
   return isNaN(n) ? 0 : n;
 }
 function modBank(n) {
-  const pfx = "m" + n + "_";
+  const pfx = "m" + n + "_", mn = "Mod " + n;
   const cellsAt = (mode) => [
-    lenum(pfx + "mode", "Mode", MODE_LABELS, MODE_SQ),
-    lenum(pfx + "sync", "Sync", MODSYNC_LABELS, MODSYNC_SQ),
-    ...modShape(mode, pfx),
-    destc(pfx + "dest", "Dest"),
-    fbip(pfx + "level", "Lvl")
+    lenum(pfx + "mode", "Mode", MODE_LABELS, MODE_SQ, mn + " Mode"),
+    lenum(pfx + "sync", "Sync", MODSYNC_LABELS, MODSYNC_SQ, mn + " Sync"),
+    ...modShape(mode, pfx, mn),
+    destc(pfx + "dest", "Dest", mn + " Dest"),
+    fbip(pfx + "level", "Lvl", mn + " Level")
   ];
   return {
     label: "Mod " + n,
@@ -176,28 +188,36 @@ function modBank(n) {
  * DSP; the cursor is purely this UI's way of picking which one knobs 6-7 edit. */
 const macroBank = {
   label: "Macros",
-  knobs: [funi("macro1", "M1"), funi("macro2", "M2"), funi("macro3", "M3"), funi("macro4", "M4"),
-          routec("Rte"), destc("macro1_dest", "Dest"), fbip("macro1_level", "Lvl")],
+  knobs: [funi("macro1", "M1", "Macro 1"), funi("macro2", "M2", "Macro 2"),
+          funi("macro3", "M3", "Macro 3"), funi("macro4", "M4", "Macro 4"),
+          routec("Rte"), destc("macro1_dest", "Dest", "Macro 1 Dest"),
+          fbip("macro1_level", "Lvl", "Macro 1 Level")],
   dynamicCells: (ctx, s) => {
     const sel = Math.max(1, Math.min(4, (s && s.macroSel) || 1));
-    return [funi("macro1", "M1"), funi("macro2", "M2"), funi("macro3", "M3"), funi("macro4", "M4"),
-            routec("Rte"), destc("macro" + sel + "_dest", "Dest"), fbip("macro" + sel + "_level", "Lvl")];
+    return [funi("macro1", "M1", "Macro 1"), funi("macro2", "M2", "Macro 2"),
+            funi("macro3", "M3", "Macro 3"), funi("macro4", "M4", "Macro 4"),
+            routec("Rte"), destc("macro" + sel + "_dest", "Dest", "Macro " + sel + " Dest"),
+            fbip("macro" + sel + "_level", "Lvl", "Macro " + sel + " Level")];
   },
   dynamicKeys: ["macro2_dest", "macro2_level", "macro3_dest", "macro3_level",
                 "macro4_dest", "macro4_level"],
   header: (ctx, s) => "Macros > M" + Math.max(1, Math.min(4, (s && s.macroSel) || 1))
 };
 
-const reorderCell = lenum("fx_reorder", "Ordr", FX_REORDER_LABELS);
+const reorderCell = lenum("fx_reorder", "Ordr", FX_REORDER_LABELS, null, "FX Reorder");
 reorderCell.sqText = (ctx) => String(FX_REORDER_LABELS[getRaw(ctx, reorderCell)] || "1-2-3-4").replace(/-/g, "");
+
+const tempoCell = count("tempo_bpm", "Tmpo", 10, 500);
+tempoCell.name = "Tempo (BPM)";
 
 const globalBank = {
   label: "Global",
-  knobs: [fvol("input_vol", "InVl"), funi("mix", "Mix"), funi("feedback", "Fdbk"),
+  knobs: [fvol("input_vol", "InVl", "Input Volume"), funi("mix", "Mix", "Mix"),
+          funi("feedback", "Fdbk", "Feedback"),
           reorderCell,
-          lenum("tempo_src", "TSrc", TEMPOSRC_LABELS),
-          count("tempo_bpm", "Tmpo", 10, 500),
-          lenum("time_div", "TDiv", TIMEDIV_LABELS, TIMEDIV_SQ),
+          lenum("tempo_src", "TSrc", TEMPOSRC_LABELS, null, "Tempo Source"),
+          tempoCell,
+          lenum("time_div", "TDiv", TIMEDIV_LABELS, TIMEDIV_SQ, "Time Division"),
           presetc("current_preset", "Prst")]
 };
 
