@@ -33,6 +33,7 @@ CID=$(MSYS_NO_PATHCONV=1 docker create -w /build "$IMAGE" bash -c '
     echo "LINK -> palette.so"
     aarch64-linux-gnu-g++ -O2 -shared -fPIC -o /build/dist/palette/palette.so "${OBJS[@]}" -lm
     cp /build/src/module.json /build/dist/palette/
+    [ -f /build/src/canvas.js ] && cp /build/src/canvas.js /build/dist/palette/ || true
     [ -f /build/src/help.json ] && cp /build/src/help.json /build/dist/palette/ || true
     ls -la /build/dist/palette/
 ')
@@ -51,6 +52,7 @@ fi
 mkdir -p dist/palette
 docker cp "$CID:/build/dist/palette/palette.so" "$ROOT_WIN/dist/palette/"
 docker cp "$CID:/build/dist/palette/module.json" "$ROOT_WIN/dist/palette/"
+docker cp "$CID:/build/dist/palette/canvas.js" "$ROOT_WIN/dist/palette/" 2>/dev/null || true
 docker cp "$CID:/build/dist/palette/help.json" "$ROOT_WIN/dist/palette/" 2>/dev/null || true
 docker rm "$CID" >/dev/null
 echo "Built: dist/palette/"

@@ -31,6 +31,10 @@
           ],
           "params": [
             {
+              "key": "editor",
+              "label": "Bank Editor"
+            },
+            {
               "level": "Console",
               "label": "PALETTE"
             },
@@ -582,6 +586,14 @@
           "1/16D",
           "1/32"
         ]
+      },
+      {
+        "key": "editor",
+        "name": "Bank Editor",
+        "type": "canvas",
+        "canvas_script": "canvas.js#bank_editor",
+        "show_footer": false,
+        "show_value": false
       }
     ]
   }

@@ -5,3 +5,7 @@ obj/
 *.so
 modules/
 .claude/
+
+# canvas previewer output (generated)
+canvas_preview.png
+tests/pm_test
