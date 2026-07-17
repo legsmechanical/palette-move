@@ -13,8 +13,9 @@
 
 KIT_PARAM_MAX = 100;
 /* Slower enum stepping (kit default 3): palette's lists are long (25 FX,
- * 22 dests, 24 reorders) — 5 detents/step matches the hand-written canvas. */
-KIT_ENUM_SENS = 5;
+ * 22 dests, 24 reorders). 5 matched the hand-written canvas; Josh wanted
+ * it slower still on device -> 7. */
+KIT_ENUM_SENS = 7;
 
 /* ---- enum label tables (must match the engine's get_param output EXACTLY —
  * see src/dsp/mod.h PM_MODE_NAMES/PM_SYNC_NAMES/PM_WAVE_NAMES/pm_dest_label,

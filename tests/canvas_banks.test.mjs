@@ -119,7 +119,7 @@ const midi = (ctx, cc, d2) => be.onMidi(ctx, { data: [0xB0, cc, d2] });
   midi(ctx, 72, 1); midi(ctx, 72, 1);                 // amount +1 (KIT_SENS=2)
   eq(ctx.writes[ctx.writes.length - 1], ["fx1_amount", "0.51"], "float write in wire format");
   ctx.writes.length = 0;
-  for (let i = 0; i < 5; i++) midi(ctx, 71, 1);       // select +1 (enum sens=5)
+  for (let i = 0; i < 7; i++) midi(ctx, 71, 1);       // select +1 (enum sens=7)
   eq(ctx.writes[ctx.writes.length - 1], ["fx1_select", "1"], "select writes the index");
   ctx.store.fx1_select = "Sweeten";                   // pretend the walk skipped Drive
   eq(ctx.getParam("fx1_select"), "Sweeten", "select cache dropped -> landed value read");
