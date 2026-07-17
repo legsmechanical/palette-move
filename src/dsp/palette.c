@@ -1628,7 +1628,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
          *    the shadow/remote UI and host chain editor can reach them too) ──────── */
         o+=snprintf(buf+o,buf_len-o,
           ",{\"key\":\"editor\",\"name\":\"Bank Editor\",\"type\":\"canvas\","
-          "\"canvas_script\":\"canvas.js#palette_editor\",\"show_footer\":false,\"show_value\":false}");
+          "\"canvas_script\":\"canvas.js#bank_editor\",\"show_footer\":false,\"show_value\":false}");
         for(int m=1;m<=PM_NUM_MODS;m++){
             o+=snprintf(buf+o,buf_len-o,",{\"key\":\"m%d_mode\",\"name\":\"Mod %d Mode\",\"type\":\"enum\",\"options\":[",m,m);
             for(int i=0;i<PM_MODE_COUNT;i++) o+=snprintf(buf+o,buf_len-o,"%s\"%s\"",i?",":"",PM_MODE_NAMES[i]);

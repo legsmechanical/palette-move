@@ -37,7 +37,7 @@ int main(void){
     CHECK(n>0 && n < (int)sizeof buf - 1, "chain_params fits buffer");
     CHECK(json_balanced(buf), "chain_params JSON balanced");
     CHECK(strstr(buf,"\"key\":\"editor\"")!=NULL, "chain_params has editor canvas");
-    CHECK(strstr(buf,"canvas.js#palette_editor")!=NULL, "chain_params canvas_script");
+    CHECK(strstr(buf,"canvas.js#bank_editor")!=NULL, "chain_params canvas_script");
     CHECK(strstr(buf,"\"key\":\"m1_mode\"")!=NULL, "chain_params m1_mode");
     CHECK(strstr(buf,"\"key\":\"m3_level\"")!=NULL, "chain_params m3_level");
     CHECK(strstr(buf,"\"key\":\"macro4_level\"")!=NULL, "chain_params macro4_level");
