@@ -31,6 +31,10 @@
           ],
           "params": [
             {
+              "key": "editor",
+              "label": "Bank Editor"
+            },
+            {
               "level": "Console",
               "label": "PALETTE"
             },
@@ -49,10 +53,6 @@
             {
               "level": "Global",
               "label": "GLOBAL"
-            },
-            {
-              "key": "editor",
-              "label": "Bank Editor"
             }
           ]
         },
