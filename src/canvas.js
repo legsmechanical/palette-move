@@ -823,10 +823,6 @@ function routec(label) {
 function presetc(key, label) {
   const c = count(key, label, 1, 25);
   c.name = "Preset";
-  /* v30 hardcoded count() at 3; v39 folds it into the shared PICK class, which
-   * this config sets to 7 for its long ENUM lists. Pinned back to 3 so the
-   * regeneration changes no feel — re-tuning is a separate, deliberate call. */
-  c.sens = 3;
   c.get = (ctx) => { const n = parseInt(ctx.getParam(key), 10); return isNaN(n) ? 1 : n; };
   c.set = (ctx, v) => ctx.setParam(key, String(v));
   c.text = (ctx) => String(ctx.getParam(key) || "1 Init");
@@ -912,9 +908,17 @@ reorderCell.sqText = (ctx) => String(FX_REORDER_LABELS[getRaw(ctx, reorderCell)]
 
 const tempoCell = count("tempo_bpm", "Tmpo", 10, 500);
 tempoCell.name = "Tempo (BPM)";
-/* Same reason as the preset cell — and it matters most here: 490 BPM at the
- * shared PICK sens of 7 would be ~3400 detents end to end, against v30's 3. */
-tempoCell.sens = 3;
+/* ⚠ The ONE cell that opts out, and for a RANGE reason rather than a taste one:
+ * 10..500 BPM at the shared PICK sens of 7 is ~3400 detents end to end. Every
+ * other pick cell here follows the config's 7, which is a real device-tested
+ * preference for palette's long lists (25 FX, 22 dests, 24 reorders).
+ *
+ * ⭑ This is a KIT GAP, not a palette quirk: movy normalises the per-detent step
+ * to ~1% of range so any knob sweeps in ~200 detents whatever its units, and the
+ * kit has no equivalent. Already on the board via widgetlab ("knob feel across
+ * ranges"). When that lands, delete this override — it is a stand-in for the
+ * rule the kit should own. */
+tempoCell.sens = 2;
 
 const globalBank = {
   label: "Global",
