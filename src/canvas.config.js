@@ -12,10 +12,17 @@
  * parse/format codec pair. */
 
 KIT_PARAM_MAX = 100;
-/* Slower enum stepping (kit default 3): palette's lists are long (25 FX,
- * 22 dests, 24 reorders). 5 matched the hand-written canvas; Josh wanted
- * it slower still on device -> 7. */
-KIT_ENUM_SENS = 7;
+/* Slower PICK stepping: palette's lists are long (25 FX, 22 dests, 24
+ * reorders). 5 matched the hand-written canvas; Josh wanted it slower still on
+ * device -> 7.
+ *
+ * ⚠⚠ Was `KIT_ENUM_SENS` until the v39 regeneration. The kit REMOVED that
+ * tunable after v30 (enum stepping folded into the PICK class), and the host
+ * evaluates canvas.js as a STRICT module — so the undeclared assignment was a
+ * ReferenceError that killed the whole canvas at load, not a silently ignored
+ * setting. Caught by the kit's own strict-load contract test; it would have
+ * shipped a module with no UI at all. */
+KIT_PICK_SENS = 7;
 
 /* ---- enum label tables (must match the engine's get_param output EXACTLY —
  * see src/dsp/mod.h PM_MODE_NAMES/PM_SYNC_NAMES/PM_WAVE_NAMES/pm_dest_label,
@@ -128,6 +135,10 @@ function routec(label) {
 function presetc(key, label) {
   const c = count(key, label, 1, 25);
   c.name = "Preset";
+  /* v30 hardcoded count() at 3; v39 folds it into the shared PICK class, which
+   * this config sets to 7 for its long ENUM lists. Pinned back to 3 so the
+   * regeneration changes no feel — re-tuning is a separate, deliberate call. */
+  c.sens = 3;
   c.get = (ctx) => { const n = parseInt(ctx.getParam(key), 10); return isNaN(n) ? 1 : n; };
   c.set = (ctx, v) => ctx.setParam(key, String(v));
   c.text = (ctx) => String(ctx.getParam(key) || "1 Init");
@@ -213,6 +224,9 @@ reorderCell.sqText = (ctx) => String(FX_REORDER_LABELS[getRaw(ctx, reorderCell)]
 
 const tempoCell = count("tempo_bpm", "Tmpo", 10, 500);
 tempoCell.name = "Tempo (BPM)";
+/* Same reason as the preset cell — and it matters most here: 490 BPM at the
+ * shared PICK sens of 7 would be ~3400 detents end to end, against v30's 3. */
+tempoCell.sens = 3;
 
 const globalBank = {
   label: "Global",
