@@ -11,6 +11,7 @@
   "raw_midi": true,
   "capabilities": {
     "chainable": true,
+    "host_canvas_ui": true,
     "component_type": "audio_fx",
     "audio_in": true,
     "midi_in": true,
